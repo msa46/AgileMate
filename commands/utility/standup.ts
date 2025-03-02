@@ -188,7 +188,7 @@ const handleList = async (interaction: ChatInputCommandInteraction) => {
     let content = '**Users in daily standup:**\n';
     
     // Fetch today's responses if needed
-    let responses = [];
+    let responses: any[] = [];
     if (showResponses) {
       responses = await convex.query(api.standupFunctions.getStandupResponsesByDate, {
         guildId,
@@ -247,7 +247,7 @@ const handleList = async (interaction: ChatInputCommandInteraction) => {
 };
 
 // Schedule the morning and evening jobs for a guild
-const scheduleJobs = (client, guildId: string) => {
+const scheduleJobs = (client: any, guildId: string) => {
   const morningJobKey = `${guildId}_morning`;
   const eveningJobKey = `${guildId}_evening`;
   
@@ -287,7 +287,7 @@ const scheduleJobs = (client, guildId: string) => {
 };
 
 // Send morning reminders to all users who have opted in
-const sendMorningReminders = async (client, guildId: string) => {
+const sendMorningReminders = async (client: any, guildId: string) => {
   try {
     const users = await convex.query(api.standupFunctions.getStandupUsers, {
       guildId
@@ -363,7 +363,7 @@ const collectStandupResponses = async (user: User, interaction: ButtonInteractio
     
     try {
       // Wait for message in DM
-      const responseCollection = await interaction.channel?.awaitMessages({
+      const responseCollection = await (interaction.channel as TextChannel).awaitMessages({
         filter: m => m.author.id === user.id,
         max: 1,
         time: 5 * 60 * 1000, // 5 minutes
@@ -401,7 +401,7 @@ const collectStandupResponses = async (user: User, interaction: ButtonInteractio
 };
 
 // Send evening summary to designated channels
-const sendEveningSummary = async (client, guildId: string) => {
+const sendEveningSummary = async (client: any, guildId: string) => {
   try {
     // Get today's responses for this guild
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
@@ -494,7 +494,7 @@ const sendEveningSummary = async (client, guildId: string) => {
 };
 
 // Load existing jobs on bot start
-export const onReady = async (client) => {
+export const onReady = async (client: any) => {
   console.log('Loading standup jobs...');
   
   try {
