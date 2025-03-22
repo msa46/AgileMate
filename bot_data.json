@@ -1,0 +1,33 @@
+{
+  "standup_entries": [
+    {
+      "user_id": "247559748990402560",
+      "display_name": "Mohammad",
+      "did": "Something",
+      "plan": "Another thing",
+      "blockers": "-",
+      "timestamp": "2025-03-21T20:54:36.220973+01:00"
+    },
+    {
+      "user_id": "247559748990402560",
+      "display_name": "Mohammad",
+      "did": "something",
+      "plan": "Someone",
+      "blockers": "None",
+      "timestamp": "2025-03-22T08:01:03.947002+01:00"
+    },
+    {
+      "user_id": "247559748990402560",
+      "display_name": "Mohammad",
+      "did": "s",
+      "plan": "1",
+      "blockers": "no",
+      "timestamp": "2025-03-22T08:22:18.064327+01:00"
+    }
+  ],
+  "summary_channel_id": "1352727615030431788",
+  "summary_time": [
+    8,
+    30
+  ]
+}
