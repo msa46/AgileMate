@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Local, NaiveDate, Timelike};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
 use poise::serenity_prelude::GatewayIntents;
+
 // Define the structure for standup entries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StandupEntry {
@@ -25,6 +26,7 @@ struct Data {
     standup_entries: Arc<Mutex<Vec<StandupEntry>>>,
     summary_channel_id: Arc<Mutex<Option<serenity::ChannelId>>>,
     summary_time: Arc<Mutex<(u32, u32)>>, // (hour, minute) in 24-hour format
+    last_summary_date: Arc<Mutex<Option<NaiveDate>>>, // Using NaiveDate instead of deprecated Date<Local>
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -39,18 +41,17 @@ async fn main() {
     let token = std::env::var("DISCORD_TOKEN").expect("Missing DISCORD_TOKEN");
 
     let intents = GatewayIntents::GUILDS
-    | GatewayIntents::GUILD_MESSAGES
-    | GatewayIntents::MESSAGE_CONTENT;
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT;
 
     // Create the framework
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![standup(), set_summary_channel(), set_summary_time()],
+            commands: vec![standup(), set_summary_channel(), set_summary_time(), trigger_summary()],
             ..Default::default()
         })
         .token(token)
         .intents(intents)
-        // .intents(serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT)
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
@@ -65,6 +66,7 @@ async fn main() {
                     schedule_summary_task(ctx_clone, data_clone).await;
                 });
                 
+                println!("Bot successfully started!");
                 Ok(data)
             })
         });
@@ -81,15 +83,19 @@ async fn load_data() -> Data {
                 standup_entries: Arc::new(Mutex::new(saved.standup_entries)),
                 summary_channel_id: Arc::new(Mutex::new(saved.summary_channel_id)),
                 summary_time: Arc::new(Mutex::new(saved.summary_time.unwrap_or((17, 0)))), // Default 5:00 PM
+                last_summary_date: Arc::new(Mutex::new(saved.last_summary_date)),
             };
         }
     }
+    
+    println!("No saved data found or could not load data. Starting with defaults.");
     
     // Default data if nothing is loaded
     Data {
         standup_entries: Arc::new(Mutex::new(Vec::new())),
         summary_channel_id: Arc::new(Mutex::new(None)),
         summary_time: Arc::new(Mutex::new((17, 0))), // Default 5:00 PM
+        last_summary_date: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -98,111 +104,140 @@ struct SavedData {
     standup_entries: Vec<StandupEntry>,
     summary_channel_id: Option<serenity::ChannelId>,
     summary_time: Option<(u32, u32)>,
+    last_summary_date: Option<NaiveDate>, // Using NaiveDate which is serializable
 }
 
 // Save data to disk
-async fn save_data(data: &Data) {
+async fn save_data(data: &Data) -> Result<(), Error> {
     let entries = data.standup_entries.lock().await.clone();
     let channel_id = *data.summary_channel_id.lock().await;
     let summary_time = *data.summary_time.lock().await;
+    let last_summary_date = *data.last_summary_date.lock().await;
     
     let saved_data = SavedData {
         standup_entries: entries,
         summary_channel_id: channel_id,
         summary_time: Some(summary_time),
+        last_summary_date,
     };
     
-    if let Ok(json) = serde_json::to_string_pretty(&saved_data) {
-        let _ = fs::write("bot_data.json", json);
-    }
+    let json = serde_json::to_string_pretty(&saved_data)
+        .map_err(|e| format!("Failed to serialize data: {}", e))?;
+    
+    fs::write("bot_data.json", json)
+        .map_err(|e| format!("Failed to write data file: {}", e))?;
+    
+    println!("Data saved successfully");
+    Ok(())
 }
 
 // Schedule the task to send daily summaries
 async fn schedule_summary_task(ctx: serenity::Context, data: Data) {
+    println!("Starting summary scheduler");
+    
+    // Use a shorter interval for checking the time to avoid missing the target time
+    let check_interval = Duration::from_secs(60); // Check every minute
+    
     loop {
         // Get the current time and the scheduled summary time
         let now = Local::now();
-        let (hour, minute) = *data.summary_time.lock().await;
+        let (target_hour, target_minute) = *data.summary_time.lock().await;
         
-        // Calculate when to send the next summary
-        let mut next_summary = now;
-        if now.hour() > hour || (now.hour() == hour && now.minute() >= minute) {
-            // If we've already passed today's summary time, schedule for tomorrow
-            next_summary = next_summary.with_hour(0).unwrap().with_minute(0).unwrap() + chrono::Duration::days(1);
+        // Send summary if we're in the target time window
+        let should_send = now.hour() == target_hour && 
+                          now.minute() >= target_minute && 
+                          now.minute() < target_minute + 5; // 5-minute window
+        
+        if should_send {
+            println!("It's time for the summary! Current time: {}:{:02}", now.hour(), now.minute());
+            
+            // Send the summary with all current entries
+            if let Err(e) = send_summary(&ctx, &data).await {
+                eprintln!("Error sending summary: {}", e);
+            } else {
+                println!("Summary sent successfully");
+            }
+            
+            // Wait a bit more than the check window to avoid duplicate summaries within the same hour
+            time::sleep(Duration::from_secs(360)).await; // 6 minutes
+        } else {
+            // Wait for the next check interval
+            time::sleep(check_interval).await;
         }
-        
-        next_summary = next_summary.with_hour(hour).unwrap().with_minute(minute).unwrap();
-        
-        // Calculate the duration until the next summary
-        let duration_until_summary = next_summary.signed_duration_since(now);
-        let seconds_until_summary = duration_until_summary.num_seconds().max(0) as u64;
-        
-        // Wait until it's time to send the summary
-        time::sleep(Duration::from_secs(seconds_until_summary)).await;
-        
-        // Send the summary
-        send_summary(&ctx, &data).await;
-        
-        // Sleep for a minute to avoid potential multiple triggers
-        time::sleep(Duration::from_secs(60)).await;
     }
 }
 
 // Send the summary and clear the stack
-async fn send_summary(ctx: &serenity::Context, data: &Data) {
+async fn send_summary(ctx: &serenity::Context, data: &Data) -> Result<(), Error> {
     let channel_id_option = *data.summary_channel_id.lock().await;
-    
-    if let Some(channel_id) = channel_id_option {
-        let mut entries = data.standup_entries.lock().await;
-        
-        if !entries.is_empty() {
-            // Group entries by user
-            let mut user_entries: HashMap<String, Vec<StandupEntry>> = HashMap::new();
-            
-            for entry in entries.iter() {
-                user_entries
-                    .entry(entry.user_id.clone())
-                    .or_insert_with(Vec::new)
-                    .push(entry.clone());
-            }
-            
-            // Create the summary message
-            let mut message = "# Daily Standup Summary\n\n".to_string();
-            
-            for (_, user_entries) in user_entries.iter() {
-                // Use the most recent entry for each user
-                if let Some(latest) = user_entries.iter().max_by_key(|e| e.timestamp) {
-                    message.push_str(&format!("## {}\n", latest.display_name));
-                    message.push_str(&format!("**Did:** {}\n", latest.did));
-                    message.push_str(&format!("**Plan:** {}\n", latest.plan));
-                    message.push_str(&format!("**Blockers:** {}\n\n", latest.blockers));
-                }
-            }
-            
-            // Send the message
-            match channel_id.say(ctx, message).await {
-                Ok(_) => {
-                    println!("Summary sent successfully.");
-                }
-                Err(e) => {
-                    eprintln!("Error sending summary: {:?}", e);
-                }
-            }
-            
-            // Clear the entries
-            entries.clear();
-            
-            // Save the updated data
-            drop(entries); // Release the lock before saving
-            save_data(data).await;
-        } else {
-            println!("No standup entries to summarize.");
-        }
-    } else {
-        println!("No summary channel set.");
-    }
-}
 
+    let channel_id = match channel_id_option {
+        Some(id) => id,
+        None => return Err("No summary channel set.".into()),
+    };
+    
+    // Create a snapshot of entries to avoid holding the lock during message sending
+    let entries_snapshot = {
+        let entries = data.standup_entries.lock().await;
+        if entries.is_empty() {
+            println!("No standup entries to summarize.");
+            return Ok(());
+        }
+        entries.clone()
+    };
+    
+    // Group entries by user
+    let mut user_entries: HashMap<String, Vec<StandupEntry>> = HashMap::new();
+    for entry in entries_snapshot.iter() {
+        user_entries
+            .entry(entry.user_id.clone())
+            .or_insert_with(Vec::new)
+            .push(entry.clone());
+    }
+
+    // Create the summary message
+    let mut message = "# Daily Standup Summary\n\n".to_string();
+
+    for (_, user_entries) in user_entries.iter() {
+        // Use the most recent entry for each user
+        if let Some(latest) = user_entries.iter().max_by_key(|e| e.timestamp) {
+            message.push_str(&format!("## {}\n", latest.display_name));
+            message.push_str(&format!("**Did:** {}\n", latest.did));
+            message.push_str(&format!("**Plan:** {}\n", latest.plan));
+            message.push_str(&format!("**Blockers:** {}\n\n", latest.blockers));
+        }
+    }
+
+    // Send the message with retry logic
+    let mut retries = 3;
+    let mut last_error = None;
+    
+    while retries > 0 {
+        match channel_id.say(ctx, &message).await {
+            Ok(_) => {
+                // Clear the entries only after successful sending
+                let mut entries = data.standup_entries.lock().await;
+                entries.clear();
+                drop(entries); // Release the lock
+                
+                // Save the updated data
+                if let Err(e) = save_data(data).await {
+                    eprintln!("Failed to save data after clearing entries: {}", e);
+                }
+                
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error sending summary (retries left: {}): {:?}", retries - 1, e);
+                last_error = Some(format!("Discord API error: {:?}", e));
+                retries -= 1;
+                time::sleep(Duration::from_secs(5)).await; // Wait before retrying
+            }
+        }
+    }
+    
+    Err(last_error.unwrap_or_else(|| "Failed to send summary after multiple attempts".into()).into())
+}
 #[poise::command(slash_command, ephemeral)]
 /// Submit your daily standup update
 async fn standup(
@@ -233,14 +268,24 @@ async fn standup(
     // Add the entry to our stack
     {
         let mut entries = ctx.data().standup_entries.lock().await;
+        
+        // Remove any previous entries from the same user (keep only latest)
+        entries.retain(|e| e.user_id != user.id.to_string());
+        
+        // Add the new entry
         entries.push(entry);
         
-        // Save the updated data
-        drop(entries); // Release the lock before saving
-        save_data(ctx.data()).await;
+        // Release the lock before saving
+        drop(entries);
     }
     
-    ctx.say("Your standup has been recorded. Thanks!").await?;
+    // Save the updated data
+    if let Err(e) = save_data(ctx.data()).await {
+        eprintln!("Failed to save data after standup submission: {}", e);
+        ctx.say("Your standup has been recorded, but there was an error saving the data.").await?;
+    } else {
+        ctx.say("Your standup has been recorded. Thanks!").await?;
+    }
     
     Ok(())
 }
@@ -287,7 +332,11 @@ async fn set_summary_channel(
             *ctx.data().summary_channel_id.lock().await = Some(channel_id);
 
             // Save the updated data
-            save_data(ctx.data()).await;
+            if let Err(e) = save_data(ctx.data()).await {
+                eprintln!("Failed to save data after setting summary channel: {}", e);
+                ctx.say("Summary channel set, but there was an error saving the configuration.").await?;
+                return Ok(());
+            }
 
             // Notify the user
             ctx.say(format!("Summary channel set to <#{}>", channel_id)).await?;
@@ -299,6 +348,7 @@ async fn set_summary_channel(
 
     Ok(())
 }
+
 #[poise::command(slash_command, ephemeral)]
 /// Set the time when daily summaries will be sent (24-hour format)
 async fn set_summary_time(
@@ -324,9 +374,50 @@ async fn set_summary_time(
     *ctx.data().summary_time.lock().await = (hour, minute);
     
     // Save the updated data
-    save_data(ctx.data()).await;
+    if let Err(e) = save_data(ctx.data()).await {
+        eprintln!("Failed to save data after setting summary time: {}", e);
+        ctx.say("Summary time set, but there was an error saving the configuration.").await?;
+        return Ok(());
+    }
     
     ctx.say(format!("Summary time set to {:02}:{:02}", hour, minute)).await?;
+    
+    Ok(())
+}
+
+#[poise::command(slash_command, ephemeral)]
+/// Manually trigger a standup summary (admin only)
+async fn trigger_summary(
+    ctx: Context<'_>,
+) -> Result<(), Error> {
+    // Check if the user has permission to manage channels
+    if let Some(member) = ctx.author_member().await {
+        if !member.permissions(ctx).map_or(false, |p| p.manage_channels()) {
+            ctx.say("You need 'Manage Channels' permission to use this command.").await?;
+            return Ok(());
+        }
+    } else {
+        ctx.say("This command can only be used in a server.").await?;
+        return Ok(());
+    }
+    
+    ctx.say("Manually triggering standup summary...").await?;
+    
+    // Send the summary
+    match send_summary(&ctx.serenity_context().clone(), ctx.data()).await {
+        Ok(_) => {
+            // Update the last summary date
+            *ctx.data().last_summary_date.lock().await = Some(Local::now().date_naive());
+            if let Err(e) = save_data(ctx.data()).await {
+                eprintln!("Failed to save data after manual summary: {}", e);
+            }
+            
+            ctx.say("Summary sent successfully!").await?;
+        },
+        Err(e) => {
+            ctx.say(format!("Failed to send summary: {}", e)).await?;
+        }
+    }
     
     Ok(())
 }
